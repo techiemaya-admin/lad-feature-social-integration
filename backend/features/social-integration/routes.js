@@ -1,5 +1,17 @@
 /**
- * Routes entry point for FeatureRegistry
- * This file is required by the core feature loading system
+ * Social Integration Feature Routes
+ * Entry point for the feature registry
+ * 
+ * LAD Architecture Compliant:
+ * - Auth middleware applied per route (not globally)
+ * - Tenant context enforced via auth middleware
+ * - Uses shared database connection
  */
-module.exports = require('./routes/index');
+
+const { pool } = require('../../shared/database/connection');
+const initializeRoutes = require('./routes/index');
+
+// Initialize routes with database connection
+const router = initializeRoutes(pool);
+
+module.exports = router;

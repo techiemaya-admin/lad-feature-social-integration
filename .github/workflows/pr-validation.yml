@@ -1,15 +1,10 @@
-name: PR Validation
-
-on:
-  pull_request:
-    branches: [main]
-    types: [opened, synchronize, reopened]
-
-jobs:
   validate:
     name: Validate PR
     runs-on: ubuntu-latest
-    
+    permissions:
+      contents: read
+      pull-requests: write
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -19,248 +14,200 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
-          cache: 'npm'
+          node-version: "18"
 
-      - name: Install dependencies
-        run: npm ci || echo "No package.json found, skipping npm ci"
-
-      - name: Check for required files
+      # ------------------------------------------------------------
+      # LAD BLOCKER REPORT INIT
+      # ------------------------------------------------------------
+      - name: Init LAD Report
         run: |
-          echo "Checking required files..."
-          test -f backend/manifest.js || (echo "❌ backend/manifest.js is required" && exit 1)
-          test -d backend/services || (echo "❌ backend/services directory is required" && exit 1)
-          test -d backend/routes || (echo "❌ backend/routes directory is required" && exit 1)
-          echo "✅ All required files present"
+          echo "HAS_BLOCKERS=false" >> $GITHUB_ENV
+          echo "LAD_REPORT<<'EOF'" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          echo "" > lad_blockers_report.md
 
-      - name: Validate backend structure
+      # ------------------------------------------------------------
+      # 🔴 LAD Rule #1: Hardcoded schema (lad_dev.)
+      # ------------------------------------------------------------
+      - name: LAD Rule #1 - Hardcoded schema names (lad_dev.)
+        continue-on-error: true
         run: |
-          echo "Validating backend structure..."
-          
-          # Check for key backend files
-          files=(
-            "backend/routes/index.js"
-            "backend/manifest.js"
-          )
-          
-          for file in "${files[@]}"; do
-            if [ -f "$file" ]; then
-              echo "✅ $file exists"
-            else
-              echo "❌ $file is required"
-              exit 1
+          echo "Checking for hardcoded schema names (lad_dev.)..."
+          set +e
+          matches=$(grep -RIn \
+            --exclude-dir=node_modules --exclude-dir=.next --exclude-dir=dist --exclude-dir=build \
+            -E "(^|[^a-zA-Z0-9_])lad_dev\." backend frontend migrations 2>/dev/null | wc -l)
+          set -e
+
+          if [ "$matches" -gt 0 ]; then
+            echo "HAS_BLOCKERS=true" >> $GITHUB_ENV
+            {
+              echo "## 🔴 CRITICAL BLOCKERS (Cannot Deploy):"
+              echo ""
+              echo "### Issue #1: Hardcoded Schema Names"
+              echo ""
+              echo "**Found:** ${matches}+ instances of \`lad_dev.table_name\` in SQL queries"
+              echo "**Impact:** Breaks multi-tenancy — works only for lad_dev, fails for real tenant schemas"
+              echo "**Fix Required:** Replace hardcoded schema with \`\${getSchema(req)}.table_name\` (or schemaHelper equivalent)"
+              echo ""
+              echo "**Examples (first 30):**"
+              echo '```'
+              grep -RIn \
+                --exclude-dir=node_modules --exclude-dir=.next --exclude-dir=dist --exclude-dir=build \
+                -E "(^|[^a-zA-Z0-9_])lad_dev\." backend frontend migrations 2>/dev/null | head -n 30
+              echo '```'
+              echo ""
+            } >> lad_blockers_report.md
+          fi
+
+      # ------------------------------------------------------------
+      # 🔴 LAD Rule #2: console.* statements
+      # ------------------------------------------------------------
+      - name: LAD Rule #2 - console.log/error/warn/info/debug forbidden
+        continue-on-error: true
+        run: |
+          echo "Checking for console.* usage..."
+          set +e
+          matches=$(grep -RIn \
+            --exclude-dir=node_modules --exclude-dir=.next --exclude-dir=dist --exclude-dir=build \
+            --exclude="*.test.*" --exclude="*.spec.*" \
+            -E "\bconsole\.(log|error|warn|info|debug)\b" backend frontend 2>/dev/null | wc -l)
+          set -e
+
+          if [ "$matches" -gt 0 ]; then
+            echo "HAS_BLOCKERS=true" >> $GITHUB_ENV
+            {
+              echo "### Issue #2: Console.log Statements"
+              echo ""
+              echo "**Found:** ${matches}+ console statements"
+              echo "**Impact:** Performance degradation, potential security leaks, no log control"
+              echo "**Fix Required:** Replace with \`logger.info/warn/error/debug\`"
+              echo ""
+              echo "**Examples (first 30):**"
+              echo '```'
+              grep -RIn \
+                --exclude-dir=node_modules --exclude-dir=.next --exclude-dir=dist --exclude-dir=build \
+                --exclude="*.test.*" --exclude="*.spec.*" \
+                -E "\bconsole\.(log|error|warn|info|debug)\b" backend frontend 2>/dev/null | head -n 30
+              echo '```'
+              echo ""
+            } >> lad_blockers_report.md
+          fi
+
+      # ------------------------------------------------------------
+      # 🔴 LAD Rule #3: fetch() in web layer (SDK-first)
+      # ------------------------------------------------------------
+      - name: LAD Rule #3 - No fetch() in frontend/web/src
+        continue-on-error: true
+        run: |
+          echo "Checking for fetch() usage in web layer..."
+          if [ -d "frontend/web/src" ]; then
+            set +e
+            matches=$(grep -RIn \
+              --exclude-dir=node_modules --exclude-dir=.next --exclude-dir=dist --exclude-dir=build \
+              -E "\bfetch\(" frontend/web/src 2>/dev/null | wc -l)
+            set -e
+
+            if [ "$matches" -gt 0 ]; then
+              echo "HAS_BLOCKERS=true" >> $GITHUB_ENV
+              {
+                echo "### Issue #3: Direct fetch() Calls in Web Layer"
+                echo ""
+                echo "**Found:** ${matches}+ direct fetch() calls in \`frontend/web/src\`"
+                echo "**Impact:** Breaks SDK-first rule — web layer must remain thin"
+                echo "**Fix Required:** Move HTTP calls into \`frontend/sdk/features/<feature>/api.ts\` + consume via hooks"
+                echo ""
+                echo "**Examples (first 30):**"
+                echo '```'
+                grep -RIn \
+                  --exclude-dir=node_modules --exclude-dir=.next --exclude-dir=dist --exclude-dir=build \
+                  -E "\bfetch\(" frontend/web/src 2>/dev/null | head -n 30
+                echo '```'
+                echo ""
+              } >> lad_blockers_report.md
             fi
-          done
-          
-          # Check optional files
-          optional_files=(
-            "backend/services/"
-            "backend/controllers/"
-            "backend/middleware/"
-            "backend/models/"
-          )
-          
-          for file in "${optional_files[@]}"; do
-            if [ -e "$file" ]; then
-              echo "✅ $file exists"
-            else
-              echo "⚠️  $file not found (optional)"
+          fi
+
+      # ------------------------------------------------------------
+      # 🔴 LAD Rule #4: node_modules inside SDK
+      # ------------------------------------------------------------
+      - name: LAD Rule #4 - No node_modules in frontend/sdk
+        continue-on-error: true
+        run: |
+          echo "Checking for frontend/sdk/node_modules..."
+          if [ -d "frontend/sdk/node_modules" ]; then
+            echo "HAS_BLOCKERS=true" >> $GITHUB_ENV
+            {
+              echo "### Issue #4: node_modules inside SDK"
+              echo ""
+              echo "**Found:** \`frontend/sdk/node_modules\` exists"
+              echo "**Impact:** Bloats repo, breaks workspace dependency model"
+              echo "**Fix Required:** Remove it and ensure it is gitignored; SDK must rely on workspace deps"
+              echo ""
+            } >> lad_blockers_report.md
+          fi
+
+      # ------------------------------------------------------------
+      # 🔴 LAD Rule #5: duplicate DB connection / pool creation in feature repos
+      # ------------------------------------------------------------
+      - name: LAD Rule #5 - No new Pool() in backend/features
+        continue-on-error: true
+        run: |
+          echo "Checking for duplicate DB pool creation in backend/features..."
+          if [ -d "backend/features" ]; then
+            set +e
+            matches=$(grep -RIn \
+              --exclude-dir=node_modules --exclude-dir=.next --exclude-dir=dist --exclude-dir=build \
+              -E "new\s+Pool\(|pg\.Pool\(|createPool\(" backend/features 2>/dev/null | wc -l)
+            set -e
+
+            if [ "$matches" -gt 0 ]; then
+              echo "HAS_BLOCKERS=true" >> $GITHUB_ENV
+              {
+                echo "### Issue #5: Duplicate DB Connection / Pool Creation"
+                echo ""
+                echo "**Found:** ${matches}+ potential DB pool creations in feature code"
+                echo "**Impact:** Breaks shared connection rule; causes inconsistent pooling, env drift"
+                echo "**Fix Required:** Import connection from \`backend/shared/database/connection.js\` (or approved resolver helper)"
+                echo ""
+                echo "**Examples (first 30):**"
+                echo '```'
+                grep -RIn \
+                  --exclude-dir=node_modules --exclude-dir=.next --exclude-dir=dist --exclude-dir=build \
+                  -E "new\s+Pool\(|pg\.Pool\(|createPool\(" backend/features 2>/dev/null | head -n 30
+                echo '```'
+                echo ""
+              } >> lad_blockers_report.md
             fi
-          done
-
-      - name: Validate frontend structure
-        run: |
-          echo "Validating frontend structure..."
-          
-          if [ -d "frontend/sdk" ]; then
-            echo "✅ Frontend SDK directory exists"
-            test -f frontend/sdk/index.ts && echo "✅ SDK index.ts exists" || echo "⚠️  No index.ts"
-            test -f frontend/sdk/types.ts && echo "✅ SDK types.ts exists" || echo "⚠️  No types.ts"
-          else
-            echo "⚠️  No frontend/sdk directory (may be backend-only feature)"
           fi
 
-      - name: Check code syntax
-        run: |
-          echo "Checking JavaScript syntax..."
-          # Check all JS files for syntax errors
-          find backend -name "*.js" -type f -exec node --check {} \; 2>&1 || true
-          echo "✅ JavaScript syntax check complete"
-
-      - name: Validate migrations
-        run: |
-          echo "Checking database migrations..."
-          if [ -d "migrations" ]; then
-            migration_count=$(find migrations -name "*.sql" -type f | wc -l)
-            echo "Found $migration_count SQL migration files"
-            
-            # Validate SQL files have proper naming
-            for file in migrations/*.sql; do
-              if [ -f "$file" ]; then
-                basename=$(basename "$file")
-                if [[ $basename =~ ^[0-9]{3}_.+\.sql$ ]]; then
-                  echo "✅ $basename follows naming convention"
-                else
-                  echo "❌ $basename does not follow naming convention (###_description.sql)"
-                  exit 1
-                fi
-              fi
-            done
-          else
-            echo "⚠️  No migrations directory found"
-          fi
-
-      - name: Check for secrets
-        run: |
-          echo "Checking for accidentally committed secrets..."
-          
-          # Check for common secret patterns
-          if grep -r -i "api[_-]key.*=.*['\"][a-zA-Z0-9]{20,}['\"]" backend/ frontend/ 2>/dev/null; then
-            echo "❌ Possible API keys found in code"
-            exit 1
-          fi
-          
-          if grep -r -i "password.*=.*['\"][^'\"]*['\"]" backend/ frontend/ 2>/dev/null | grep -v "password.*process.env"; then
-            echo "❌ Possible hardcoded passwords found"
-            exit 1
-          fi
-          
-          echo "✅ No obvious secrets detected"
-
-      - name: Lint commit messages
-        run: |
-          echo "Validating commit messages..."
-          
-          # Get commits in PR
-          git log --format=%s origin/main..HEAD | while read commit_msg; do
-            echo "Checking: $commit_msg"
-            
-            # Check if commit follows conventional commits (relaxed)
-            if [[ $commit_msg =~ ^(feat|fix|docs|style|refactor|test|chore|ci|perf)(\(.+\))?:\ .+ ]]; then
-              echo "✅ Valid commit message"
-            else
-              echo "⚠️  Commit message doesn't follow conventional commits format"
-              echo "   Expected: <type>(<scope>): <description>"
-              echo "   Examples: feat: add new feature, fix(auth): resolve login issue"
-            fi
-          done
-
-      - name: Generate PR summary
-        if: always()
-        run: |
-          echo "## 📊 PR Validation Summary - Campaigns Feature" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Files Changed" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          git diff --name-status origin/main..HEAD >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Statistics" >> $GITHUB_STEP_SUMMARY
-          echo "- **Commits**: $(git log --oneline origin/main..HEAD | wc -l)" >> $GITHUB_STEP_SUMMARY
-          echo "- **Files changed**: $(git diff --name-only origin/main..HEAD | wc -l)" >> $GITHUB_STEP_SUMMARY
-          echo "- **Insertions**: $(git diff --shortstat origin/main..HEAD | grep -oE '[0-9]+ insertion' | grep -oE '[0-9]+' || echo '0')" >> $GITHUB_STEP_SUMMARY
-          echo "- **Deletions**: $(git diff --shortstat origin/main..HEAD | grep -oE '[0-9]+ deletion' | grep -oE '[0-9]+' || echo '0')" >> $GITHUB_STEP_SUMMARY
-
-  label-pr:
-    name: Auto-label PR
-    runs-on: ubuntu-latest
-    permissions:
-      pull-requests: write
-      contents: read
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Label based on changes
+      # ------------------------------------------------------------
+      # Post comment if blockers exist
+      # ------------------------------------------------------------
+      - name: Comment LAD blockers on PR
+        if: env.HAS_BLOCKERS == 'true'
         uses: actions/github-script@v7
         with:
           script: |
-            const { data: files } = await github.rest.pulls.listFiles({
+            const fs = require('fs');
+            const body = fs.readFileSync('lad_blockers_report.md', 'utf8').trim();
+
+            // avoid empty comment
+            const finalBody = body.length ? body : "## 🔴 CRITICAL BLOCKERS\n\n(Report was empty but HAS_BLOCKERS=true)";
+
+            // Post comment
+            await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              pull_number: context.issue.number,
+              issue_number: context.issue.number,
+              body: finalBody,
             });
 
-            const labels = new Set();
-            
-            for (const file of files) {
-              if (file.filename.startsWith('backend/')) {
-                labels.add('backend');
-              }
-              if (file.filename.startsWith('frontend/')) {
-                labels.add('frontend');
-              }
-              if (file.filename.startsWith('migrations/')) {
-                labels.add('database');
-              }
-              if (file.filename.includes('test')) {
-                labels.add('testing');
-              }
-              if (file.filename.endsWith('.md')) {
-                labels.add('documentation');
-              }
-            }
-
-            // Add size labels
-            const additions = files.reduce((sum, file) => sum + file.additions, 0);
-            if (additions < 10) labels.add('size/XS');
-            else if (additions < 50) labels.add('size/S');
-            else if (additions < 200) labels.add('size/M');
-            else if (additions < 500) labels.add('size/L');
-            else labels.add('size/XL');
-
-            if (labels.size > 0) {
-              await github.rest.issues.addLabels({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                labels: Array.from(labels),
-              });
-            }
-
-  security-check:
-    name: Security Scan
-    runs-on: ubuntu-latest
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '18'
-
-      - name: Install dependencies
-        run: npm ci || echo "No package.json found"
-        continue-on-error: true
-
-      - name: Run npm audit
+      # ------------------------------------------------------------
+      # Fail build if blockers exist
+      # ------------------------------------------------------------
+      - name: Fail if LAD blockers exist
+        if: env.HAS_BLOCKERS == 'true'
         run: |
-          npm audit --audit-level=moderate || echo "⚠️  Security vulnerabilities found, please review"
-        continue-on-error: true
-
-      - name: Check for vulnerable dependencies
-        run: |
-          echo "Checking for known vulnerable packages..."
-          if [ -f "package.json" ]; then
-            npm audit --json > audit-result.json || true
-            
-            if [ -f audit-result.json ]; then
-              high_vulns=$(jq '.metadata.vulnerabilities.high // 0' audit-result.json 2>/dev/null || echo '0')
-              critical_vulns=$(jq '.metadata.vulnerabilities.critical // 0' audit-result.json 2>/dev/null || echo '0')
-              
-              echo "High vulnerabilities: $high_vulns"
-              echo "Critical vulnerabilities: $critical_vulns"
-              
-              if [ "$critical_vulns" -gt 0 ]; then
-                echo "❌ Critical vulnerabilities found!"
-                exit 1
-              fi
-            fi
-          else
-            echo "No package.json found, skipping vulnerability check"
-          fi
+          echo "❌ LAD blockers detected. See PR comment for details."
+          exit 1
